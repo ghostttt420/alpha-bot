@@ -125,6 +125,27 @@ def ocr_smart_scan(file_path, engine=2):
         print(f"OCR Error: {e}")
         return ""
 
+def validate_solana_address(address):
+    """
+    Quick validation for Solana addresses
+    Returns True if the address looks valid
+    """
+    # Must be 32-44 characters (most are 43-44)
+    if len(address) < 32 or len(address) > 44:
+        return False
+    
+    # Must only contain Base58 characters
+    if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', address):
+        return False
+    
+    # Should have good character distribution (not all same chars)
+    if len(set(address)) < 20:
+        return False
+    
+    # Common Solana address patterns start with certain chars
+    # Most tokens start with: A-H, 1-9 (not a hard rule but helps filter)
+    return True
+
 def extract_contract_addresses(text):
     """
     Extract contract addresses for multiple blockchains
@@ -141,28 +162,37 @@ def extract_contract_addresses(text):
     # Combine both for better matching
     all_text = clean_text + " " + text_no_newlines
     
-    # Solana (Base58, 32-44 chars)
-    # More strict pattern to avoid false positives
-    solana_pattern = r'[1-9A-HJ-NP-Za-km-z]{43,44}'  # Most Solana addresses are 43-44 chars
-    solana_matches = re.findall(solana_pattern, all_text)
+    # Also keep original for reference
+    all_text += " " + text
     
     seen = set()
-    for addr in solana_matches:
-        # Avoid duplicates
-        if addr in seen:
-            continue
+    
+    # Try multiple patterns for Solana addresses
+    # Pattern 1: Strict 43-44 chars (most common)
+    solana_patterns = [
+        r'[1-9A-HJ-NP-Za-km-z]{43,44}',  # Most common length
+        r'[1-9A-HJ-NP-Za-km-z]{40,44}',  # Slightly more lenient
+        r'[1-9A-HJ-NP-Za-km-z]{32,44}',  # Very lenient fallback
+    ]
+    
+    for pattern in solana_patterns:
+        solana_matches = re.findall(pattern, all_text)
         
-        # Filter out obvious false positives
-        # Real Solana addresses have good character distribution
-        if len(set(addr)) < 20:  # Too few unique characters
-            continue
+        for addr in solana_matches:
+            # Avoid duplicates
+            if addr in seen:
+                continue
             
-        # Check if it's not just repeating patterns
-        if addr[0] * len(addr) == addr:  # All same character
-            continue
-            
-        seen.add(addr)
-        addresses.append({'chain': 'solana', 'address': addr})
+            # Validate the address
+            if not validate_solana_address(addr):
+                continue
+                
+            seen.add(addr)
+            addresses.append({'chain': 'solana', 'address': addr})
+        
+        # If we found addresses with strict pattern, don't try looser ones
+        if addresses:
+            break
     
     # Ethereum/Base/BSC (0x + 40 hex chars)
     eth_matches = re.findall(r'0x[a-fA-F0-9]{40}', all_text)
@@ -234,7 +264,7 @@ def format_token_message(token_data, ca, chain):
     Format token data into a nice Telegram message
     """
     if not token_data:
-        return f"❌ No data found for CA: `{ca}`"
+        return f"❌ No data found for CA: `{ca}`\n\n⚠️ The address might be incorrect due to OCR errors.\n\n💡 Try cropping the image to just show the contract address for better accuracy."
     
     emoji_chain = "🔵" if chain == "ethereum" else "🟣"
     price_emoji = "📈" if token_data['price_change_24h'] > 0 else "📉"
@@ -271,7 +301,7 @@ def handle_photo(message):
         
         # Try multiple preprocessing strategies
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 1/4)...**",
+            "⚙️ **Processing image (Strategy 1/5)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
@@ -285,7 +315,7 @@ def handle_photo(message):
         text2 = ocr_smart_scan(proc_path, engine=1)
         
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 2/4)...**",
+            "⚙️ **Processing image (Strategy 2/5)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
@@ -296,7 +326,7 @@ def handle_photo(message):
         text3 = ocr_smart_scan(proc_inv_path, engine=2)
         
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 3/4)...**",
+            "⚙️ **Processing image (Strategy 3/5)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
@@ -305,28 +335,45 @@ def handle_photo(message):
         # Strategy 4: Inverted with engine 1
         text4 = ocr_smart_scan(proc_inv_path, engine=1)
         
-        # Strategy 5: EasyOCR fallback (if available and API calls failed)
+        # Strategy 5: EasyOCR on both versions
         text5 = ""
-        if EASYOCR_AVAILABLE and (not text1 and not text2 and not text3 and not text4):
+        text6 = ""
+        if EASYOCR_AVAILABLE:
             bot.edit_message_text(
-                "⚙️ **Processing with fallback OCR...**",
+                "⚙️ **Processing image (Strategy 4/5)...**",
                 message.chat.id,
                 status.message_id,
                 parse_mode='Markdown'
             )
-            text5 = ocr_easyocr_scan(proc_inv_path)
+            text5 = ocr_easyocr_scan(proc_path)
+            
+            bot.edit_message_text(
+                "⚙️ **Processing image (Strategy 5/5)...**",
+                message.chat.id,
+                status.message_id,
+                parse_mode='Markdown'
+            )
+            text6 = ocr_easyocr_scan(proc_inv_path)
         
         # Combine all results - more data = better chance of catching the full CA
-        combined_text = f"{text1}\n{text2}\n{text3}\n{text4}\n{text5}"
+        combined_text = f"{text1}\n{text2}\n{text3}\n{text4}\n{text5}\n{text6}"
         
-        # Debug: Print what we extracted (remove in production)
+        # Debug: Print what we extracted
         print(f"OCR Results Combined Length: {len(combined_text)}")
-        print(f"Sample: {combined_text[:500]}")
+        print(f"Text 1 (Enhanced + E2): {text1[:200]}")
+        print(f"Text 2 (Enhanced + E1): {text2[:200]}")
+        print(f"Text 3 (Inverted + E2): {text3[:200]}")
+        print(f"Text 4 (Inverted + E1): {text4[:200]}")
+        if EASYOCR_AVAILABLE:
+            print(f"Text 5 (EasyOCR Enhanced): {text5[:200]}")
+            print(f"Text 6 (EasyOCR Inverted): {text6[:200]}")
         
         # Extract contract addresses
         addresses = extract_contract_addresses(combined_text)
         
         if not addresses:
+            # Show debug info to help user
+            sample_text = combined_text[:500] if combined_text else "No text extracted"
             bot.edit_message_text(
                 "❌ **No contract address found**\n\n"
                 "💡 Tips:\n"
@@ -334,7 +381,8 @@ def handle_photo(message):
                 "• CA should be visible and not cut off\n"
                 "• Try cropping to just the CA text\n"
                 "• Make sure the image isn't too dark\n\n"
-                f"🔍 Debug: Extracted {len(combined_text)} characters",
+                f"🔍 Extracted {len(combined_text)} characters\n"
+                f"📝 Sample: `{sample_text[:100]}...`",
                 message.chat.id,
                 status.message_id,
                 parse_mode='Markdown'
@@ -396,6 +444,8 @@ def handle_photo(message):
             parse_mode='Markdown'
         )
         print(f"Error in handle_photo: {e}")
+        import traceback
+        traceback.print_exc()
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -408,9 +458,38 @@ def send_welcome(message):
         "• Price changes\n"
         "• DEX info\n\n"
         "🔗 Supports: Solana, Ethereum, Base, BSC\n\n"
+        "💡 **Pro tip:** For best results, crop your screenshot to just show the contract address!\n\n"
         "Just send a screenshot and I'll do the rest! 🚀",
         parse_mode='Markdown'
     )
+
+@bot.message_handler(commands=['test'])
+def test_address(message):
+    """
+    Test command to manually input a CA
+    Usage: /test D8FYTqJGSmJx2cchFDUgzMYEe4VDvUyGWAYCRJ4Xbonk
+    """
+    try:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            bot.reply_to(message, "Usage: /test <contract_address>")
+            return
+        
+        ca = parts[1].strip()
+        
+        # Determine chain
+        if ca.startswith('0x'):
+            chain = 'ethereum'
+            token_data = get_eth_token_data(ca)
+        else:
+            chain = 'solana'
+            token_data = get_solana_token_data(ca)
+        
+        result_msg = format_token_message(token_data, ca, chain)
+        bot.reply_to(message, result_msg, parse_mode='Markdown', disable_web_page_preview=True)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 if __name__ == "__main__":
     print("🤖 Bot started...")
