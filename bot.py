@@ -9,55 +9,62 @@ import easyocr
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
-# Initialize EasyOCR once (Global) - CPU Mode
-# This downloads the model on the first run (takes ~30s)
-print("Loading Neural Network...")
+# Initialize Neural Network (CPU Mode)
+# This will download the model on the first run (approx 2-3 mins)
+print("Loading EasyOCR Model...")
 reader = easyocr.Reader(['en'], gpu=False) 
 
 def preprocess_image(input_path, output_path):
     """
-    Standardizes image for the Neural Network.
-    Converts dark mode -> bright text for easier reading.
+    Prepares image for Neural OCR.
+    High contrast helps the AI differentiate text from dark backgrounds.
     """
     with Image.open(input_path) as img:
         img = img.convert('RGB')
-        # Scale up 2x (Neural nets love resolution)
+        # Scale 2x for better character recognition
         w, h = img.size
         img = img.resize((w*2, h*2), Image.Resampling.LANCZOS)
         
-        # Binarize: High Contrast
+        # Binarize: Make text bright white, background pure black
         img = ImageOps.grayscale(img)
         img = ImageEnhance.Contrast(img).enhance(4.0)
         img = ImageEnhance.Sharpness(img).enhance(2.0)
         img.save(output_path, quality=100)
 
-def extract_solana_ca(text):
+def extract_solana_ca(text_list):
     """
-    Advanced Logic: Finds the best candidate string.
-    1. Removes all spaces (fixes wrapped lines).
-    2. Scans for 32-44 char strings.
-    3. Validates Base58 rules (No 0, O, I, l).
+    Logic: Finds the valid CA hidden in the noise.
     """
-    # 1. Stitch everything into one block to fix newlines
-    clean_block = re.sub(r'\s+', '', text)
+    # 1. Join all text chunks into one continuous stream (fixes the broken 'k')
+    # We use a unique separator just in case, then strip it for the stitch check
+    raw_stream = "".join(text_list)
     
-    # 2. Fix common OCR mix-ups
-    replacements = {'0': 'D', 'O': 'Q', 'I': 'j', 'l': 'k'}
-    for k, v in replacements.items():
-        clean_block = clean_block.replace(k, v)
-        
-    # 3. Sliding Window Regex
-    # We look for the longest valid string of Base58 chars
-    # This prevents "NFAD8..." because 'NFA' + 'D8...' is usually > 44 chars
-    pattern = r'[1-9A-HJ-NP-Za-km-z]{32,44}'
-    matches = re.findall(pattern, clean_block)
+    # 2. Clean up common OCR mix-ups 
+    # (Fixes '0' -> 'D', 'l' -> 'k' which might happen in the CA)
+    # But be careful not to turn "Gold" (G-o-l-d) into valid chars yet.
+    # Strategy: First look for potential candidates, THEN fix them.
     
-    # 4. Entropy Filter (Filter out marketing words)
+    # 3. Sliding Window / Regex Search
+    # We look for long strings of alphanumerics.
+    # Then we check if they fit the STRICT Solana profile.
+    
+    # Remove spaces/newlines to stitch lines
+    clean_stream = re.sub(r'\s+', '', raw_stream)
+    
+    # Regex: Find potential Base58 blocks (32-44 chars)
+    # This pattern excludes 0, O, I, l which are illegal in Solana
+    strict_pattern = r'[1-9A-HJ-NP-Za-km-z]{32,44}'
+    matches = re.findall(strict_pattern, clean_stream)
+    
     best_candidate = None
+    
     for match in matches:
-        # Real CAs look like noise (high variety of chars)
-        if len(set(match)) >= 25: 
-            # If we have multiple, prefer the longest one (safest bet)
+        # 4. ENTROPY CHECK (The "English Word" Filter)
+        # Marketing text like "ThisGoesMultiMillions" has repeating letters.
+        # A real CA is random. We check for >20 unique characters.
+        unique_chars = len(set(match))
+        if unique_chars >= 25:
+            # If we find multiple, prefer the longer one (usually the CA)
             if best_candidate is None or len(match) > len(best_candidate):
                 best_candidate = match
                 
@@ -67,30 +74,30 @@ def extract_solana_ca(text):
 def handle_photo(message):
     status = bot.reply_to(message, "🧠 **Neural Scan Active...**")
     
+    # Download image
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
     
-    with open("raw.jpg", 'wb') as f: f.write(downloaded_file)
+    with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
     
     # 1. Preprocess
-    preprocess_image("raw.jpg", "proc.jpg")
+    preprocess_image("scan.jpg", "proc.jpg")
     
-    # 2. EasyOCR Scan (The Heavy Lifting)
-    # detail=0 returns just the list of words
+    # 2. EasyOCR Scan
     try:
+        # detail=0 gives us just the list of strings found
         result_list = reader.readtext("proc.jpg", detail=0)
-        combined_text = "".join(result_list) # Join tightly
     except Exception as e:
         bot.edit_message_text(f"❌ OCR Error: {str(e)}", message.chat.id, status.message_id)
         return
 
-    # 3. Extraction Logic
-    ca = extract_solana_ca(combined_text)
+    # 3. Extraction
+    ca = extract_solana_ca(result_list)
     
     if ca:
-        # Success Path
+        # Success! Fetch Data
         try:
-            res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}").json()
+            res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}", timeout=5).json()
             if res.get('pairs'):
                 pair = res['pairs'][0]
                 msg = (
@@ -103,10 +110,12 @@ def handle_photo(message):
                 markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
                 bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
             else:
-                bot.edit_message_text(f"✅ **CA Found:** `{ca}`\n(No market data yet - super early!)", message.chat.id, status.message_id)
+                bot.edit_message_text(f"✅ **CA Found:** `{ca}`\n(Token is live but no market data yet)", message.chat.id, status.message_id)
         except:
              bot.edit_message_text(f"✅ **CA Found:** `{ca}`", message.chat.id, status.message_id)
     else:
-        bot.edit_message_text("❌ No Solana CA found. The image might be too noisy.", message.chat.id, status.message_id)
+        # If no CA is found, show what text WAS found to help debug (optional)
+        debug_text = "".join(result_list)[:50] + "..."
+        bot.edit_message_text(f"❌ No valid Solana CA found.\nDebug: Saw '{debug_text}'", message.chat.id, status.message_id)
 
 bot.infinity_polling()
