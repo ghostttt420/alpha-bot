@@ -10,112 +10,118 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
 # Initialize Neural Network (CPU Mode)
-# This will download the model on the first run (approx 2-3 mins)
-print("Loading EasyOCR Model...")
-reader = easyocr.Reader(['en'], gpu=False) 
+# Downloads model on first run (~2 mins)
+print("Loading Neural Network...")
+reader = easyocr.Reader(['en'], gpu=False)
 
 def preprocess_image(input_path, output_path):
     """
-    Prepares image for Neural OCR.
-    High contrast helps the AI differentiate text from dark backgrounds.
+    Industrial Pre-processing:
+    Forces text to be pure black/white to remove 'noise' from dark mode.
     """
     with Image.open(input_path) as img:
         img = img.convert('RGB')
-        # Scale 2x for better character recognition
+        # Scale 2x for Neural Net readability
         w, h = img.size
         img = img.resize((w*2, h*2), Image.Resampling.LANCZOS)
         
-        # Binarize: Make text bright white, background pure black
+        # Binarize (High Contrast)
         img = ImageOps.grayscale(img)
         img = ImageEnhance.Contrast(img).enhance(4.0)
         img = ImageEnhance.Sharpness(img).enhance(2.0)
         img.save(output_path, quality=100)
 
-def extract_solana_ca(text_list):
+def fetch_market_data(ca):
+    """Returns pair data if valid, None if invalid"""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+        res = requests.get(url, timeout=5).json()
+        if res.get('pairs'):
+            return res['pairs'][0]
+    except:
+        pass
+    return None
+
+def smart_extract_ca(raw_text_list):
     """
-    Logic: Finds the valid CA hidden in the noise.
+    The Brain: Stitches broken lines, filters noise, and validates against the market.
     """
-    # 1. Join all text chunks into one continuous stream (fixes the broken 'k')
-    # We use a unique separator just in case, then strip it for the stitch check
-    raw_stream = "".join(text_list)
-    
-    # 2. Clean up common OCR mix-ups 
-    # (Fixes '0' -> 'D', 'l' -> 'k' which might happen in the CA)
-    # But be careful not to turn "Gold" (G-o-l-d) into valid chars yet.
-    # Strategy: First look for potential candidates, THEN fix them.
-    
-    # 3. Sliding Window / Regex Search
-    # We look for long strings of alphanumerics.
-    # Then we check if they fit the STRICT Solana profile.
-    
-    # Remove spaces/newlines to stitch lines
-    clean_stream = re.sub(r'\s+', '', raw_stream)
-    
-    # Regex: Find potential Base58 blocks (32-44 chars)
-    # This pattern excludes 0, O, I, l which are illegal in Solana
-    strict_pattern = r'[1-9A-HJ-NP-Za-km-z]{32,44}'
-    matches = re.findall(strict_pattern, clean_stream)
-    
-    best_candidate = None
-    
-    for match in matches:
-        # 4. ENTROPY CHECK (The "English Word" Filter)
-        # Marketing text like "ThisGoesMultiMillions" has repeating letters.
-        # A real CA is random. We check for >20 unique characters.
-        unique_chars = len(set(match))
-        if unique_chars >= 25:
-            # If we find multiple, prefer the longer one (usually the CA)
-            if best_candidate is None or len(match) > len(best_candidate):
-                best_candidate = match
+    # 1. Join everything into one block to fix the "broken k" issue
+    # We strip all spaces so "D8FY... k" becomes "D8FY...k"
+    full_block = "".join(raw_text_list)
+    clean_block = re.sub(r'\s+', '', full_block)
+
+    # 2. Strict Regex: Excludes 0, O, I, l (Solana Illegal Chars)
+    # This automatically removes "Gold" (has l), "DYOR" (has O)
+    pattern = r'[1-9A-HJ-NP-Za-km-z]{32,48}' # Allow slightly longer to catch "NFA"+CA
+    matches = re.findall(pattern, clean_block)
+
+    for candidate in matches:
+        # 3. The "Prefix Stripper" Logic
+        # Sometimes "NFA" (valid chars) gets glued to the front. 
+        # We test the raw string, then test it with first 3-4 chars removed.
+        
+        # Attempt 1: Raw Match
+        if fetch_market_data(candidate):
+            return candidate
+            
+        # Attempt 2: Strip common noise prefixes (NFA, ATH are 3 chars)
+        # If candidate is 46 chars, and we strip 3, we get 43 (Valid CA length)
+        if len(candidate) > 40:
+            trimmed = candidate[3:] # Try removing "NFA"
+            if fetch_market_data(trimmed):
+                return trimmed
                 
-    return best_candidate
+            trimmed_4 = candidate[4:] # Try removing "BUY "
+            if fetch_market_data(trimmed_4):
+                return trimmed_4
+
+    return None
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     status = bot.reply_to(message, "🧠 **Neural Scan Active...**")
     
-    # Download image
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
     
     with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
     
-    # 1. Preprocess
+    # 1. Preprocess Image
     preprocess_image("scan.jpg", "proc.jpg")
     
     # 2. EasyOCR Scan
     try:
-        # detail=0 gives us just the list of strings found
+        # detail=0 gives just the text strings
         result_list = reader.readtext("proc.jpg", detail=0)
     except Exception as e:
-        bot.edit_message_text(f"❌ OCR Error: {str(e)}", message.chat.id, status.message_id)
+        bot.edit_message_text(f"❌ System Error: {str(e)}", message.chat.id, status.message_id)
         return
 
-    # 3. Extraction
-    ca = extract_solana_ca(result_list)
+    # 3. Intelligent Extraction
+    ca = smart_extract_ca(result_list)
     
     if ca:
-        # Success! Fetch Data
-        try:
-            res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}", timeout=5).json()
-            if res.get('pairs'):
-                pair = res['pairs'][0]
-                msg = (
-                    f"🎯 **CA:** `{ca}`\n\n"
-                    f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
-                    f"💰 **Price:** `${pair['priceUsd']}`\n"
-                    f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
-                )
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
-                bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
-            else:
-                bot.edit_message_text(f"✅ **CA Found:** `{ca}`\n(Token is live but no market data yet)", message.chat.id, status.message_id)
-        except:
-             bot.edit_message_text(f"✅ **CA Found:** `{ca}`", message.chat.id, status.message_id)
+        pair = fetch_market_data(ca) # Fetch again for display
+        if pair:
+            msg = (
+                f"🎯 **CA:** `{ca}`\n\n"
+                f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
+                f"💰 **Price:** `${pair['priceUsd']}`\n"
+                f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
+                f"📉 **1H Chg:** `{pair['priceChange']['h1']}%`"
+            )
+            markup = InlineKeyboardMarkup()
+            # Direct deep-link to Trojan for 1-tap buy
+            markup.add(InlineKeyboardButton("🚀 Fast Buy (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
+            markup.add(InlineKeyboardButton("📈 DexScreener", url=pair['url']))
+            
+            bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
+        else:
+            # Valid CA format but no liquidity (Brand new launch)
+            bot.edit_message_text(f"⚠️ **CA Found:** `{ca}`\n\nToken is live on-chain but has no trading pairs yet.", message.chat.id, status.message_id)
     else:
-        # If no CA is found, show what text WAS found to help debug (optional)
-        debug_text = "".join(result_list)[:50] + "..."
-        bot.edit_message_text(f"❌ No valid Solana CA found.\nDebug: Saw '{debug_text}'", message.chat.id, status.message_id)
+        # Debug info for you
+        bot.edit_message_text("❌ No valid CA found.\n(Filtered out noise like 'Gold'/'DYOR')", message.chat.id, status.message_id)
 
 bot.infinity_polling()
