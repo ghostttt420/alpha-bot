@@ -9,6 +9,17 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 OCR_KEY = os.getenv('OCR_API_KEY')
 bot = telebot.TeleBot(TOKEN)
 
+# Try to import EasyOCR as fallback (optional but recommended)
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+    # Initialize reader once (reuse across requests)
+    easy_reader = easyocr.Reader(['en'], gpu=False)
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    easy_reader = None
+    print("⚠️ EasyOCR not available. Install with: pip install easyocr")
+
 def preprocess_image(input_path, output_path):
     """
     Multi-stage preprocessing for better OCR on dark/stylized screenshots
@@ -64,6 +75,21 @@ def preprocess_inverted(input_path, output_path):
         
         img.save(output_path, quality=100, dpi=(300, 300))
 
+def ocr_easyocr_scan(file_path):
+    """
+    Fallback OCR using EasyOCR (runs locally, no API key needed)
+    Often better for screenshots with styled text
+    """
+    if not EASYOCR_AVAILABLE:
+        return ""
+    
+    try:
+        result = easy_reader.readtext(file_path, detail=0, paragraph=False)
+        return ' '.join(result)
+    except Exception as e:
+        print(f"EasyOCR Error: {e}")
+        return ""
+
 def ocr_smart_scan(file_path, engine=2):
     """
     OCR with configurable engine
@@ -104,25 +130,46 @@ def extract_contract_addresses(text):
     Extract contract addresses for multiple blockchains
     Returns dict with blockchain type and address
     """
-    # Remove all whitespace and newlines for multi-line addresses
-    clean_text = re.sub(r'\s+', '', text)
-    
     addresses = []
     
-    # Solana (Base58, 32-44 chars, starts with specific chars)
-    solana_matches = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', clean_text)
+    # CRITICAL: Remove whitespace for matching (handles multi-line CAs)
+    clean_text = re.sub(r'\s+', '', text)
+    
+    # Also try on original text with just newlines removed
+    text_no_newlines = text.replace('\n', '').replace('\r', '')
+    
+    # Combine both for better matching
+    all_text = clean_text + " " + text_no_newlines
+    
+    # Solana (Base58, 32-44 chars)
+    # More strict pattern to avoid false positives
+    solana_pattern = r'[1-9A-HJ-NP-Za-km-z]{43,44}'  # Most Solana addresses are 43-44 chars
+    solana_matches = re.findall(solana_pattern, all_text)
+    
+    seen = set()
     for addr in solana_matches:
-        # Filter out common false positives
-        if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', addr):
+        # Avoid duplicates
+        if addr in seen:
             continue
+        
+        # Filter out obvious false positives
+        # Real Solana addresses have good character distribution
+        if len(set(addr)) < 20:  # Too few unique characters
+            continue
+            
+        # Check if it's not just repeating patterns
+        if addr[0] * len(addr) == addr:  # All same character
+            continue
+            
+        seen.add(addr)
         addresses.append({'chain': 'solana', 'address': addr})
     
     # Ethereum/Base/BSC (0x + 40 hex chars)
-    # Keep original text for these (preserve 0x)
-    eth_text = re.sub(r'\s+', '', text)
-    eth_matches = re.findall(r'0x[a-fA-F0-9]{40}', eth_text)
+    eth_matches = re.findall(r'0x[a-fA-F0-9]{40}', all_text)
     for addr in eth_matches:
-        addresses.append({'chain': 'ethereum', 'address': addr})
+        if addr not in seen:
+            seen.add(addr)
+            addresses.append({'chain': 'ethereum', 'address': addr})
     
     return addresses
 
@@ -224,39 +271,57 @@ def handle_photo(message):
         
         # Try multiple preprocessing strategies
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 1/3)...**",
+            "⚙️ **Processing image (Strategy 1/4)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
         )
         
-        # Strategy 1: Enhanced preprocessing
+        # Strategy 1: Enhanced preprocessing with engine 2
         preprocess_image(raw_path, proc_path)
         text1 = ocr_smart_scan(proc_path, engine=2)
         
+        # Strategy 2: Same preprocessing with engine 1 (sometimes better for styled text)
+        text2 = ocr_smart_scan(proc_path, engine=1)
+        
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 2/3)...**",
+            "⚙️ **Processing image (Strategy 2/4)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
         )
         
-        # Strategy 2: Inverted colors
+        # Strategy 3: Inverted colors with engine 2
         preprocess_inverted(raw_path, proc_inv_path)
-        text2 = ocr_smart_scan(proc_inv_path, engine=2)
+        text3 = ocr_smart_scan(proc_inv_path, engine=2)
         
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 3/3)...**",
+            "⚙️ **Processing image (Strategy 3/4)...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
         )
         
-        # Strategy 3: Try engine 1 on inverted
-        text3 = ocr_smart_scan(proc_inv_path, engine=1)
+        # Strategy 4: Inverted with engine 1
+        text4 = ocr_smart_scan(proc_inv_path, engine=1)
         
-        # Combine all results
-        combined_text = text1 + "\n" + text2 + "\n" + text3
+        # Strategy 5: EasyOCR fallback (if available and API calls failed)
+        text5 = ""
+        if EASYOCR_AVAILABLE and (not text1 and not text2 and not text3 and not text4):
+            bot.edit_message_text(
+                "⚙️ **Processing with fallback OCR...**",
+                message.chat.id,
+                status.message_id,
+                parse_mode='Markdown'
+            )
+            text5 = ocr_easyocr_scan(proc_inv_path)
+        
+        # Combine all results - more data = better chance of catching the full CA
+        combined_text = f"{text1}\n{text2}\n{text3}\n{text4}\n{text5}"
+        
+        # Debug: Print what we extracted (remove in production)
+        print(f"OCR Results Combined Length: {len(combined_text)}")
+        print(f"Sample: {combined_text[:500]}")
         
         # Extract contract addresses
         addresses = extract_contract_addresses(combined_text)
@@ -267,7 +332,9 @@ def handle_photo(message):
                 "💡 Tips:\n"
                 "• Ensure the screenshot is clear\n"
                 "• CA should be visible and not cut off\n"
-                "• Try cropping to just the CA text",
+                "• Try cropping to just the CA text\n"
+                "• Make sure the image isn't too dark\n\n"
+                f"🔍 Debug: Extracted {len(combined_text)} characters",
                 message.chat.id,
                 status.message_id,
                 parse_mode='Markdown'
@@ -347,4 +414,5 @@ def send_welcome(message):
 
 if __name__ == "__main__":
     print("🤖 Bot started...")
+    print(f"📊 EasyOCR Available: {EASYOCR_AVAILABLE}")
     bot.infinity_polling()
