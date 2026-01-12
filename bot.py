@@ -20,6 +20,23 @@ except ImportError:
     easy_reader = None
     print("⚠️ EasyOCR not available. Install with: pip install easyocr")
 
+# Common OCR character confusions
+OCR_CORRECTIONS = {
+    'A': ['4'],  # OCR often reads 4 as A
+    '4': ['A'],
+    'O': ['0'],
+    '0': ['O'],
+    'I': ['1', 'l'],
+    '1': ['I', 'l'],
+    'l': ['1', 'I'],
+    'S': ['5'],
+    '5': ['S'],
+    'B': ['8'],
+    '8': ['B'],
+    'Z': ['2'],
+    '2': ['Z'],
+}
+
 def preprocess_image(input_path, output_path):
     """
     Multi-stage preprocessing for better OCR on dark/stylized screenshots
@@ -29,21 +46,21 @@ def preprocess_image(input_path, output_path):
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # 1. Increase size first for better detail
+        # 1. Increase size even more for character accuracy
         w, h = img.size
-        img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
+        img = img.resize((w*4, h*4), Image.Resampling.LANCZOS)
         
         # 2. Convert to grayscale
         img = ImageOps.grayscale(img)
         
         # 3. Increase contrast significantly (helps with dark backgrounds)
-        img = ImageEnhance.Contrast(img).enhance(3.0)
+        img = ImageEnhance.Contrast(img).enhance(3.5)
         
         # 4. Increase brightness (crucial for dark screenshots)
-        img = ImageEnhance.Brightness(img).enhance(1.5)
+        img = ImageEnhance.Brightness(img).enhance(1.8)
         
         # 5. Sharpen to enhance text edges
-        img = ImageEnhance.Sharpness(img).enhance(2.0)
+        img = ImageEnhance.Sharpness(img).enhance(2.5)
         
         # 6. Apply slight blur then sharpen (reduces noise)
         img = img.filter(ImageFilter.MedianFilter(size=3))
@@ -64,13 +81,13 @@ def preprocess_inverted(input_path, output_path):
             img = img.convert('RGB')
         
         w, h = img.size
-        img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
+        img = img.resize((w*4, h*4), Image.Resampling.LANCZOS)
         
         # Invert colors BEFORE grayscale
         img = ImageOps.invert(img)
         img = ImageOps.grayscale(img)
-        img = ImageEnhance.Contrast(img).enhance(2.5)
-        img = ImageEnhance.Sharpness(img).enhance(1.8)
+        img = ImageEnhance.Contrast(img).enhance(3.0)
+        img = ImageEnhance.Sharpness(img).enhance(2.5)
         img = ImageOps.autocontrast(img)
         
         img.save(output_path, quality=100, dpi=(300, 300))
@@ -125,13 +142,28 @@ def ocr_smart_scan(file_path, engine=2):
         print(f"OCR Error: {e}")
         return ""
 
+def generate_address_variants(address):
+    """
+    Generate variants of an address by correcting common OCR errors
+    """
+    variants = [address]
+    
+    # Try fixing common character confusions
+    for i, char in enumerate(address):
+        if char in OCR_CORRECTIONS:
+            for replacement in OCR_CORRECTIONS[char]:
+                variant = address[:i] + replacement + address[i+1:]
+                variants.append(variant)
+    
+    return variants
+
 def validate_solana_address(address):
     """
     Quick validation for Solana addresses
     Returns True if the address looks valid
     """
     # Must be 32-44 characters (most are 43-44)
-    if len(address) < 32 or len(address) > 44:
+    if len(address) < 40 or len(address) > 44:  # More lenient for truncated
         return False
     
     # Must only contain Base58 characters
@@ -139,12 +171,70 @@ def validate_solana_address(address):
         return False
     
     # Should have good character distribution (not all same chars)
-    if len(set(address)) < 20:
+    if len(set(address)) < 15:  # Lower threshold for shorter addresses
         return False
     
-    # Common Solana address patterns start with certain chars
-    # Most tokens start with: A-H, 1-9 (not a hard rule but helps filter)
     return True
+
+def test_address_on_chain(address, chain='solana'):
+    """
+    Test if an address exists on-chain by querying DexScreener
+    Returns True if the address is found
+    """
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return data.get('pairs') and len(data['pairs']) > 0
+    except:
+        return False
+
+def find_best_address_match(potential_addresses):
+    """
+    Given multiple potential addresses (including OCR errors),
+    find the one that actually exists on-chain
+    """
+    print(f"Testing {len(potential_addresses)} potential addresses...")
+    
+    for addr in potential_addresses:
+        print(f"  Testing: {addr}")
+        if test_address_on_chain(addr):
+            print(f"  ✅ FOUND: {addr}")
+            return addr
+    
+    print("  ❌ No valid address found")
+    return None
+
+def generate_truncated_variants(address):
+    """
+    Generate variants by adding possible missing characters at the end
+    Common Solana address endings
+    """
+    if len(address) >= 44:
+        return [address]  # Already full length
+    
+    # Most common Base58 characters that appear at end of Solana addresses
+    common_endings = ['k', 'h', 'n', 't', 'p', 'm', 'K', 'H', 'N', 'T', 'P', 'M',
+                      '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                      'A', 'B', 'C', 'D', 'E', 'F', 'G', 'J', 'L', 'Q', 'R', 'S', 'U', 'V', 'W', 'X', 'Y', 'Z',
+                      'a', 'b', 'c', 'd', 'e', 'f', 'g', 'j', 'k', 'm', 'n', 'p', 'q', 'r', 's', 'u', 'v', 'w', 'x', 'y', 'z']
+    
+    variants = [address]
+    
+    # If address is 42-43 chars, add 1-2 characters
+    chars_needed = 44 - len(address)
+    
+    if chars_needed == 1:
+        # Try adding each possible character
+        for char in common_endings:
+            variants.append(address + char)
+    elif chars_needed == 2:
+        # Try common 2-char endings
+        for char1 in common_endings[:30]:  # Limit to most common
+            for char2 in common_endings[:30]:
+                variants.append(address + char1 + char2)
+    
+    return variants
 
 def extract_contract_addresses(text):
     """
@@ -160,46 +250,76 @@ def extract_contract_addresses(text):
     text_no_newlines = text.replace('\n', '').replace('\r', '')
     
     # Combine both for better matching
-    all_text = clean_text + " " + text_no_newlines
-    
-    # Also keep original for reference
-    all_text += " " + text
+    all_text = clean_text + " " + text_no_newlines + " " + text
     
     seen = set()
+    candidates = []
     
     # Try multiple patterns for Solana addresses
-    # Pattern 1: Strict 43-44 chars (most common)
     solana_patterns = [
-        r'[1-9A-HJ-NP-Za-km-z]{43,44}',  # Most common length
-        r'[1-9A-HJ-NP-Za-km-z]{40,44}',  # Slightly more lenient
-        r'[1-9A-HJ-NP-Za-km-z]{32,44}',  # Very lenient fallback
+        r'[1-9A-HJ-NP-Za-km-z]{43,44}',  # Full length
+        r'[1-9A-HJ-NP-Za-km-z]{42,43}',  # Missing 1-2 chars
+        r'[1-9A-HJ-NP-Za-km-z]{40,42}',  # Missing 2-4 chars (very lenient)
     ]
     
     for pattern in solana_patterns:
         solana_matches = re.findall(pattern, all_text)
         
         for addr in solana_matches:
-            # Avoid duplicates
             if addr in seen:
                 continue
             
-            # Validate the address
-            if not validate_solana_address(addr):
-                continue
-                
+            # For short addresses, generate truncated variants
+            if len(addr) < 44:
+                truncated_variants = generate_truncated_variants(addr)
+                print(f"Generated {len(truncated_variants)} variants for truncated address: {addr}")
+            else:
+                truncated_variants = [addr]
+            
             seen.add(addr)
-            addresses.append({'chain': 'solana', 'address': addr})
-        
-        # If we found addresses with strict pattern, don't try looser ones
-        if addresses:
-            break
+            
+            # For each truncated variant, also apply OCR corrections
+            for trunc_variant in truncated_variants:
+                if not validate_solana_address(trunc_variant):
+                    continue
+                
+                # Apply OCR corrections to this variant
+                ocr_variants = generate_address_variants(trunc_variant)
+                
+                for final_variant in ocr_variants:
+                    if validate_solana_address(final_variant) and final_variant not in [c['address'] for c in candidates]:
+                        candidates.append({
+                            'chain': 'solana',
+                            'address': final_variant,
+                            'original': addr,
+                            'is_variant': final_variant != addr
+                        })
+    
+    # Smart selection: Test candidates on-chain to find valid ones
+    print(f"Found {len(candidates)} candidates (including variants)")
+    
+    # First, try original addresses (full length, no modifications)
+    for candidate in candidates:
+        if not candidate['is_variant']:
+            if test_address_on_chain(candidate['address']):
+                addresses.append(candidate)
+                print(f"✅ Original address works: {candidate['address']}")
+                return addresses  # Found it!
+    
+    # If no originals work, try variants (batch test for speed)
+    print("Testing corrected variants...")
+    for candidate in candidates[:100]:  # Limit to first 100 to avoid too many API calls
+        if candidate['is_variant']:
+            if test_address_on_chain(candidate['address']):
+                addresses.append(candidate)
+                print(f"✅ Corrected address works: {candidate['address']} (was: {candidate['original']})")
+                return addresses  # Found it!
     
     # Ethereum/Base/BSC (0x + 40 hex chars)
     eth_matches = re.findall(r'0x[a-fA-F0-9]{40}', all_text)
     for addr in eth_matches:
-        if addr not in seen:
-            seen.add(addr)
-            addresses.append({'chain': 'ethereum', 'address': addr})
+        if addr not in [a['address'] for a in addresses]:
+            addresses.append({'chain': 'ethereum', 'address': addr, 'original': addr, 'is_variant': False})
     
     return addresses
 
@@ -259,17 +379,21 @@ def get_eth_token_data(ca):
         print(f"Error fetching ETH data: {e}")
     return None
 
-def format_token_message(token_data, ca, chain):
+def format_token_message(token_data, ca, chain, was_corrected=False):
     """
     Format token data into a nice Telegram message
     """
     if not token_data:
-        return f"❌ No data found for CA: `{ca}`\n\n⚠️ The address might be incorrect due to OCR errors.\n\n💡 Try cropping the image to just show the contract address for better accuracy."
+        return f"❌ No data found for CA: `{ca}`"
     
     emoji_chain = "🔵" if chain == "ethereum" else "🟣"
     price_emoji = "📈" if token_data['price_change_24h'] > 0 else "📉"
     
-    msg = f"{emoji_chain} **{token_data['name']} (${token_data['symbol']})**\n\n"
+    msg = ""
+    if was_corrected:
+        msg += "🔧 **Auto-corrected OCR errors!**\n\n"
+    
+    msg += f"{emoji_chain} **{token_data['name']} (${token_data['symbol']})**\n\n"
     msg += f"💰 **Price:** ${token_data['price']:.8f}\n"
     msg += f"{price_emoji} **24h Change:** {token_data['price_change_24h']:.2f}%\n"
     msg += f"💧 **Liquidity:** ${token_data['liquidity']:,.2f}\n"
@@ -301,7 +425,7 @@ def handle_photo(message):
         
         # Try multiple preprocessing strategies
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 1/5)...**",
+            "⚙️ **Analyzing image with AI...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
@@ -311,78 +435,46 @@ def handle_photo(message):
         preprocess_image(raw_path, proc_path)
         text1 = ocr_smart_scan(proc_path, engine=2)
         
-        # Strategy 2: Same preprocessing with engine 1 (sometimes better for styled text)
+        # Strategy 2: Same preprocessing with engine 1
         text2 = ocr_smart_scan(proc_path, engine=1)
-        
-        bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 2/5)...**",
-            message.chat.id,
-            status.message_id,
-            parse_mode='Markdown'
-        )
         
         # Strategy 3: Inverted colors with engine 2
         preprocess_inverted(raw_path, proc_inv_path)
         text3 = ocr_smart_scan(proc_inv_path, engine=2)
         
+        # Strategy 4: Inverted with engine 1
+        text4 = ocr_smart_scan(proc_inv_path, engine=1)
+        
+        # Strategy 5-6: EasyOCR on both versions
+        text5 = ""
+        text6 = ""
+        if EASYOCR_AVAILABLE:
+            text5 = ocr_easyocr_scan(proc_path)
+            text6 = ocr_easyocr_scan(proc_inv_path)
+        
+        # Combine all results
+        combined_text = f"{text1}\n{text2}\n{text3}\n{text4}\n{text5}\n{text6}"
+        
+        print(f"OCR Results Combined Length: {len(combined_text)}")
+        
         bot.edit_message_text(
-            "⚙️ **Processing image (Strategy 3/5)...**",
+            "🔍 **Detecting contract addresses...**",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
         )
         
-        # Strategy 4: Inverted with engine 1
-        text4 = ocr_smart_scan(proc_inv_path, engine=1)
-        
-        # Strategy 5: EasyOCR on both versions
-        text5 = ""
-        text6 = ""
-        if EASYOCR_AVAILABLE:
-            bot.edit_message_text(
-                "⚙️ **Processing image (Strategy 4/5)...**",
-                message.chat.id,
-                status.message_id,
-                parse_mode='Markdown'
-            )
-            text5 = ocr_easyocr_scan(proc_path)
-            
-            bot.edit_message_text(
-                "⚙️ **Processing image (Strategy 5/5)...**",
-                message.chat.id,
-                status.message_id,
-                parse_mode='Markdown'
-            )
-            text6 = ocr_easyocr_scan(proc_inv_path)
-        
-        # Combine all results - more data = better chance of catching the full CA
-        combined_text = f"{text1}\n{text2}\n{text3}\n{text4}\n{text5}\n{text6}"
-        
-        # Debug: Print what we extracted
-        print(f"OCR Results Combined Length: {len(combined_text)}")
-        print(f"Text 1 (Enhanced + E2): {text1[:200]}")
-        print(f"Text 2 (Enhanced + E1): {text2[:200]}")
-        print(f"Text 3 (Inverted + E2): {text3[:200]}")
-        print(f"Text 4 (Inverted + E1): {text4[:200]}")
-        if EASYOCR_AVAILABLE:
-            print(f"Text 5 (EasyOCR Enhanced): {text5[:200]}")
-            print(f"Text 6 (EasyOCR Inverted): {text6[:200]}")
-        
-        # Extract contract addresses
+        # Extract contract addresses with smart correction
         addresses = extract_contract_addresses(combined_text)
         
         if not addresses:
-            # Show debug info to help user
-            sample_text = combined_text[:500] if combined_text else "No text extracted"
             bot.edit_message_text(
                 "❌ **No contract address found**\n\n"
-                "💡 Tips:\n"
-                "• Ensure the screenshot is clear\n"
-                "• CA should be visible and not cut off\n"
-                "• Try cropping to just the CA text\n"
-                "• Make sure the image isn't too dark\n\n"
-                f"🔍 Extracted {len(combined_text)} characters\n"
-                f"📝 Sample: `{sample_text[:100]}...`",
+                "💡 The screenshot might be:\n"
+                "• Too blurry or low resolution\n"
+                "• Missing the full contract address\n"
+                "• Using an unsupported format\n\n"
+                "Try sending a clearer screenshot!",
                 message.chat.id,
                 status.message_id,
                 parse_mode='Markdown'
@@ -390,12 +482,13 @@ def handle_photo(message):
             return
         
         # Process each found address
-        for idx, addr_info in enumerate(addresses[:3]):  # Limit to 3 addresses
+        for idx, addr_info in enumerate(addresses[:3]):
             ca = addr_info['address']
             chain = addr_info['chain']
+            was_corrected = addr_info.get('is_variant', False)
             
             bot.edit_message_text(
-                f"🎯 **CA Found ({idx+1}/{len(addresses[:3])}):**\n`{ca}`\n\n"
+                f"✅ **CA Detected!**\n`{ca}`\n\n"
                 f"📊 Fetching {chain.title()} market data...",
                 message.chat.id,
                 status.message_id,
@@ -409,10 +502,9 @@ def handle_photo(message):
                 token_data = get_eth_token_data(ca)
             
             # Send results
-            result_msg = format_token_message(token_data, ca, chain)
+            result_msg = format_token_message(token_data, ca, chain, was_corrected)
             
             if idx == 0:
-                # Edit the status message for the first result
                 bot.edit_message_text(
                     result_msg,
                     message.chat.id,
@@ -421,7 +513,6 @@ def handle_photo(message):
                     disable_web_page_preview=True
                 )
             else:
-                # Send new message for additional results
                 bot.send_message(
                     message.chat.id,
                     result_msg,
@@ -429,7 +520,7 @@ def handle_photo(message):
                     disable_web_page_preview=True
                 )
             
-            time.sleep(0.5)  # Rate limit protection
+            time.sleep(0.5)
         
         # Clean up
         for path in [raw_path, proc_path, proc_inv_path]:
@@ -438,7 +529,7 @@ def handle_photo(message):
                 
     except Exception as e:
         bot.edit_message_text(
-            f"❌ **Error:** {str(e)}\n\nPlease try again or contact support.",
+            f"❌ **Error:** {str(e)}\n\nPlease try again!",
             message.chat.id,
             status.message_id,
             parse_mode='Markdown'
@@ -451,15 +542,17 @@ def handle_photo(message):
 def send_welcome(message):
     bot.reply_to(
         message,
-        "👋 **Welcome to Crypto CA Scanner!**\n\n"
-        "📸 Send me a screenshot with a contract address and I'll fetch:\n"
-        "• Token price & market cap\n"
-        "• 24h volume & liquidity\n"
-        "• Price changes\n"
-        "• DEX info\n\n"
-        "🔗 Supports: Solana, Ethereum, Base, BSC\n\n"
-        "💡 **Pro tip:** For best results, crop your screenshot to just show the contract address!\n\n"
-        "Just send a screenshot and I'll do the rest! 🚀",
+        "👋 **Welcome to Snap Alpha!**\n\n"
+        "📸 **How it works:**\n"
+        "1. Send me ANY crypto screenshot\n"
+        "2. I'll auto-detect the contract address\n"
+        "3. Get instant token data!\n\n"
+        "✨ **Features:**\n"
+        "• Auto-corrects OCR errors\n"
+        "• Works with dark/light screenshots\n"
+        "• Supports Solana, ETH, Base, BSC\n"
+        "• No cropping needed!\n\n"
+        "🚀 Just send a screenshot and I'll handle the rest!",
         parse_mode='Markdown'
     )
 
@@ -492,6 +585,6 @@ def test_address(message):
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
 if __name__ == "__main__":
-    print("🤖 Bot started...")
+    print("🤖 Snap Alpha Bot started...")
     print(f"📊 EasyOCR Available: {EASYOCR_AVAILABLE}")
     bot.infinity_polling()
