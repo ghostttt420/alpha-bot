@@ -19,6 +19,7 @@ def preprocess_image(input_path, output_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
+        # 3x Scale for maximum clarity
         img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
         img = ImageOps.grayscale(img)
         img = ImageEnhance.Contrast(img).enhance(2.0)
@@ -30,7 +31,7 @@ def batch_check_dex(candidates):
     """
     valid_pairs = []
     
-    # Remove duplicates
+    # Remove duplicates to save space
     unique_candidates = list(set(candidates))
     
     # DexScreener allows max 30 addresses per call
@@ -92,6 +93,7 @@ def fast_mine(text_results):
                 sub = chunk[start : start + length]
                 
                 # 3. Generate Mutations for THIS window
+                # Instead of checking immediately, we just ADD to the list
                 variants = generate_mutations(sub)
                 all_candidates.extend(variants)
 
@@ -142,6 +144,7 @@ def handle_photo(message):
         
         bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
     else:
+        # Debug output only if it fails
         bot.edit_message_text(
             f"❌ **Scan Failed.**\nChecked {len(results)} text blocks but found no valid token.", 
             message.chat.id, status.message_id, parse_mode='Markdown'
