@@ -9,32 +9,24 @@ import easyocr
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
-# DEFINING THE CONSTRAINTS
-# Solana Base58 Alphabet (No 0, O, I, l)
+# SOLANA ALPHABET (No 0, O, I, l)
+# We use this to force the OCR to stay on track
 SOLANA_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# Initialize EasyOCR with strict whitelist
-# This tells the AI: "Only recognize these characters. Ignore everything else."
-print("Loading Neural Network with Constraints...")
+print("Loading Neural Network...")
 reader = easyocr.Reader(['en'], gpu=False)
 
 def preprocess_image(input_path, output_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
-        # 3x Scale for maximum clarity on the characters
         img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
-        
-        # High Contrast
         img = ImageOps.grayscale(img)
-        img = ImageEnhance.Contrast(img).enhance(2.5)
+        img = ImageEnhance.Contrast(img).enhance(2.0)
         img = ImageEnhance.Sharpness(img).enhance(2.0)
         img.save(output_path, quality=100)
 
 def check_dex(ca):
-    """
-    Checks if a CA is valid on DexScreener.
-    """
     if len(ca) < 32 or len(ca) > 44: return None
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
@@ -44,47 +36,55 @@ def check_dex(ca):
     except: pass
     return None
 
-def generate_mutations(candidate):
+def surgical_mutations(candidate):
     """
-    The 'Fuzzy' Fixer.
-    If OCR mistook a '4' for an 'A', this creates a variant to test.
+    THE FIX: Swaps ambiguous chars ONE BY ONE.
+    Solves the problem where 'A' exists correctly in one spot 
+    but is a typo for '4' in another spot.
     """
-    mutations = [candidate]
+    mutations = []
     
-    # Common OCR confusions in Crypto Fonts
-    # We only swap if the char exists, to save API calls
-    if 'A' in candidate: mutations.append(candidate.replace('A', '4'))
-    if '4' in candidate: mutations.append(candidate.replace('4', 'A'))
-    if '8' in candidate: mutations.append(candidate.replace('8', 'B'))
-    if 'B' in candidate: mutations.append(candidate.replace('B', '8'))
+    # Map of common OCR mix-ups
+    confusions = {
+        'A': ['4'], '4': ['A'],
+        'B': ['8'], '8': ['B'],
+        'G': ['6'], '6': ['G'],
+        'Q': ['O', 'D'], # Q often mistaken for O/D
+        'D': ['0', 'O'], # If we allowed 0/O, we'd map them here
+    }
     
-    return list(set(mutations)) # Return unique mutations only
+    # Iterate through every character in the string
+    for i, char in enumerate(candidate):
+        if char in confusions:
+            # For each confusion, create a new string with JUST THIS ONE char swapped
+            for replacement in confusions[char]:
+                new_variant = candidate[:i] + replacement + candidate[i+1:]
+                mutations.append(new_variant)
+                
+    return mutations
 
 def smart_mine(text_results):
-    # 1. Join everything. The Whitelist means we have less garbage to clean.
     full_stream = "".join(text_results)
     
-    # 2. Extract anything that looks vaguely like a CA
-    # Since we whitelisted, almost everything remaining is a potential char
-    # We look for long blocks
+    # Extract long blocks (we use the Whitelist, so data is cleaner)
+    # We look for anything 32+ chars long
     chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', full_stream)
     
     for chunk in chunks:
-        # THE SLIDER
         chunk_len = len(chunk)
-        # Test every window of 32-44 chars
+        # SLIDING WINDOW (32-44 chars)
         for length in range(32, 45):
             for start in range(0, chunk_len - length + 1):
                 sub = chunk[start : start + length]
                 
-                # LEVEL 1: Check raw extraction
+                # Check 1: Is the raw OCR correct?
                 pair = check_dex(sub)
                 if pair: return sub, pair
                 
-                # LEVEL 2: Check Mutations (Fixing A vs 4, etc)
-                variants = generate_mutations(sub)
+                # Check 2: Try Surgical Mutations
+                # This will generate "WAY...CRJ4X" from "WAY...CRJAX"
+                variants = surgical_mutations(sub)
                 for v in variants:
-                    if v == sub: continue
                     pair = check_dex(v)
                     if pair: return v, pair
 
@@ -92,7 +92,7 @@ def smart_mine(text_results):
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
-    status = bot.reply_to(message, "🧠 **Constrained Neural Scan...**")
+    status = bot.reply_to(message, "🧬 **Surgical Scan Active...**")
     
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -101,9 +101,7 @@ def handle_photo(message):
     preprocess_image("scan.jpg", "proc.jpg")
     
     try:
-        # THE MAGIC LINE: allowlist=SOLANA_CHARS
-        # We force the OCR to ignore "NFA" (if we removed F/A from list, but we can't)
-        # Instead, this ensures it never reads a '?' or '@' or '0'.
+        # Strict Whitelist + Detail=0
         results = reader.readtext("proc.jpg", detail=0, allowlist=SOLANA_CHARS)
     except Exception as e:
         bot.edit_message_text(f"❌ Error: {e}", message.chat.id, status.message_id)
@@ -124,12 +122,12 @@ def handle_photo(message):
         
         bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
     else:
-        # Debug
+        # Debug: Show the raw text so we can see if the 'A' is still there
         debug_tail = "".join(results)[-80:]
         bot.edit_message_text(
-            f"❌ **Mining Failed.**\n\n"
-            f"Constrained Output:\n`...{debug_tail}`\n"
-            f"Tried mutations but found no match.", 
+            f"❌ **Scan Failed.**\n\n"
+            f"Raw Output:\n`...{debug_tail}`\n"
+            f"Surgical mutations failed to fix the typo.", 
             message.chat.id, status.message_id, parse_mode='Markdown'
         )
 
