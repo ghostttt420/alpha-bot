@@ -9,8 +9,7 @@ import easyocr
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
-# SOLANA ALPHABET (No 0, O, I, l)
-# We use this to force the OCR to stay on track
+# SOLANA ALPHABET (Strict Whitelist)
 SOLANA_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 print("Loading Neural Network...")
@@ -23,76 +22,97 @@ def preprocess_image(input_path, output_path):
         img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
         img = ImageOps.grayscale(img)
         img = ImageEnhance.Contrast(img).enhance(2.0)
-        img = ImageEnhance.Sharpness(img).enhance(2.0)
         img.save(output_path, quality=100)
 
-def check_dex(ca):
-    if len(ca) < 32 or len(ca) > 44: return None
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-        res = requests.get(url, timeout=1).json()
-        if res.get('pairs'):
-            return res['pairs'][0]
-    except: pass
-    return None
-
-def surgical_mutations(candidate):
+def batch_check_dex(candidates):
     """
-    THE FIX: Swaps ambiguous chars ONE BY ONE.
-    Solves the problem where 'A' exists correctly in one spot 
-    but is a typo for '4' in another spot.
+    THE SPEED FIX: Checks up to 30 addresses in ONE network call.
     """
-    mutations = []
+    valid_pairs = []
     
-    # Map of common OCR mix-ups
+    # Remove duplicates
+    unique_candidates = list(set(candidates))
+    
+    # DexScreener allows max 30 addresses per call
+    chunk_size = 30
+    for i in range(0, len(unique_candidates), chunk_size):
+        batch = unique_candidates[i : i + chunk_size]
+        try:
+            # Join with commas: "addr1,addr2,addr3"
+            query_string = ",".join(batch)
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{query_string}"
+            
+            res = requests.get(url, timeout=3).json()
+            if res.get('pairs'):
+                # We found matches! Add them to our list.
+                valid_pairs.extend(res['pairs'])
+        except:
+            pass
+            
+    return valid_pairs
+
+def generate_mutations(candidate):
+    """
+    Creates variations to fix common OCR typos (A->4, B->8, etc)
+    """
+    mutations = {candidate} # Start with the raw string
+    
     confusions = {
         'A': ['4'], '4': ['A'],
         'B': ['8'], '8': ['B'],
         'G': ['6'], '6': ['G'],
-        'Q': ['O', 'D'], # Q often mistaken for O/D
-        'D': ['0', 'O'], # If we allowed 0/O, we'd map them here
+        'Q': ['O', 'D'], 
+        'D': ['0', 'O']
     }
     
-    # Iterate through every character in the string
+    # Generate all simple 1-char swaps
     for i, char in enumerate(candidate):
         if char in confusions:
-            # For each confusion, create a new string with JUST THIS ONE char swapped
             for replacement in confusions[char]:
+                # Swap just this one character
                 new_variant = candidate[:i] + replacement + candidate[i+1:]
-                mutations.append(new_variant)
+                mutations.add(new_variant)
                 
-    return mutations
+    return list(mutations)
 
-def smart_mine(text_results):
+def fast_mine(text_results):
     full_stream = "".join(text_results)
     
-    # Extract long blocks (we use the Whitelist, so data is cleaner)
-    # We look for anything 32+ chars long
+    # 1. Collect ALL possible chunks (32+ chars)
+    # We use the whitelist so this data is cleaner than before
     chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', full_stream)
+    
+    all_candidates = []
     
     for chunk in chunks:
         chunk_len = len(chunk)
-        # SLIDING WINDOW (32-44 chars)
+        # 2. Sliding Window (32-44 chars)
         for length in range(32, 45):
             for start in range(0, chunk_len - length + 1):
                 sub = chunk[start : start + length]
                 
-                # Check 1: Is the raw OCR correct?
-                pair = check_dex(sub)
-                if pair: return sub, pair
-                
-                # Check 2: Try Surgical Mutations
-                # This will generate "WAY...CRJ4X" from "WAY...CRJAX"
-                variants = surgical_mutations(sub)
-                for v in variants:
-                    pair = check_dex(v)
-                    if pair: return v, pair
+                # 3. Generate Mutations for THIS window
+                variants = generate_mutations(sub)
+                all_candidates.extend(variants)
+
+    # 4. THE SHOTGUN: Check all 100+ candidates in 1-2 API calls
+    if not all_candidates:
+        return None, None
+        
+    print(f"Checking {len(all_candidates)} candidates...") # Debug log
+    valid_pairs = batch_check_dex(all_candidates)
+    
+    if valid_pairs:
+        # Return the most liquid pair found
+        # (Sort by liquidity to avoid low-liq scam clones)
+        best_pair = max(valid_pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0)))
+        return best_pair['baseToken']['address'], best_pair
 
     return None, None
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
-    status = bot.reply_to(message, "🧬 **Surgical Scan Active...**")
+    status = bot.reply_to(message, "🚀 **Turbo Scan Active...**")
     
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -101,13 +121,13 @@ def handle_photo(message):
     preprocess_image("scan.jpg", "proc.jpg")
     
     try:
-        # Strict Whitelist + Detail=0
+        # Strict Whitelist scan
         results = reader.readtext("proc.jpg", detail=0, allowlist=SOLANA_CHARS)
     except Exception as e:
         bot.edit_message_text(f"❌ Error: {e}", message.chat.id, status.message_id)
         return
 
-    ca, pair = smart_mine(results)
+    ca, pair = fast_mine(results)
     
     if ca and pair:
         msg = (
@@ -122,12 +142,8 @@ def handle_photo(message):
         
         bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
     else:
-        # Debug: Show the raw text so we can see if the 'A' is still there
-        debug_tail = "".join(results)[-80:]
         bot.edit_message_text(
-            f"❌ **Scan Failed.**\n\n"
-            f"Raw Output:\n`...{debug_tail}`\n"
-            f"Surgical mutations failed to fix the typo.", 
+            f"❌ **Scan Failed.**\nChecked {len(results)} text blocks but found no valid token.", 
             message.chat.id, status.message_id, parse_mode='Markdown'
         )
 
