@@ -18,7 +18,7 @@ def ocr_from_image(file_path):
     with open(file_path, 'rb') as f:
         r = requests.post('https://api.ocr.space/parse/image',
                           files={file_path: f},
-                          data=payload)
+                          data=payload, timeout=30)
     result = r.json()
     if result.get('ParsedResults'):
         return result['ParsedResults'][0]['ParsedText']
