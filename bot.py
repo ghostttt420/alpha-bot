@@ -9,94 +9,107 @@ import easyocr
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
-# Initialize Neural Network (CPU Mode)
-print("Loading Neural Network...")
-reader = easyocr.Reader(['en'], gpu=False) 
+# DEFINING THE CONSTRAINTS
+# Solana Base58 Alphabet (No 0, O, I, l)
+SOLANA_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# Initialize EasyOCR with strict whitelist
+# This tells the AI: "Only recognize these characters. Ignore everything else."
+print("Loading Neural Network with Constraints...")
+reader = easyocr.Reader(['en'], gpu=False)
 
 def preprocess_image(input_path, output_path):
-    """
-    Standardizes image for EasyOCR.
-    """
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
-        img = img.resize((w*2, h*2), Image.Resampling.LANCZOS)
+        # 3x Scale for maximum clarity on the characters
+        img = img.resize((w*3, h*3), Image.Resampling.LANCZOS)
         
-        # Mild Binarization to keep grey text visible
+        # High Contrast
         img = ImageOps.grayscale(img)
-        img = ImageEnhance.Contrast(img).enhance(2.0) 
-        img = ImageEnhance.Sharpness(img).enhance(1.5)
+        img = ImageEnhance.Contrast(img).enhance(2.5)
+        img = ImageEnhance.Sharpness(img).enhance(2.0)
         img.save(output_path, quality=100)
 
-def check_dexscreener(ca):
+def check_dex(ca):
     """
-    The 'Truth' Oracle. Returns pair data if CA is valid.
+    Checks if a CA is valid on DexScreener.
     """
+    if len(ca) < 32 or len(ca) > 44: return None
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-        res = requests.get(url, timeout=2).json()
+        res = requests.get(url, timeout=1).json()
         if res.get('pairs'):
             return res['pairs'][0]
     except: pass
     return None
 
-def mine_for_ca(text_list):
+def generate_mutations(candidate):
     """
-    MINING LOGIC:
-    Takes the noisy text stream and slides a window over it 
-    to find the specific substring that works on-chain.
+    The 'Fuzzy' Fixer.
+    If OCR mistook a '4' for an 'A', this creates a variant to test.
     """
-    # 1. Create the "Dirt Pile" (Join everything, remove spaces)
-    full_stream = "".join(text_list)
-    clean_stream = re.sub(r'\s+', '', full_stream)
+    mutations = [candidate]
     
-    # 2. Extract potential "chunks" (long alphanumeric strings)
-    # We look for anything that *could* contain a CA (32+ chars)
-    # This grabs "NFAD8FY...bonk501"
-    chunks = re.findall(r'[a-zA-Z0-9]{32,}', clean_stream)
+    # Common OCR confusions in Crypto Fonts
+    # We only swap if the char exists, to save API calls
+    if 'A' in candidate: mutations.append(candidate.replace('A', '4'))
+    if '4' in candidate: mutations.append(candidate.replace('4', 'A'))
+    if '8' in candidate: mutations.append(candidate.replace('8', 'B'))
+    if 'B' in candidate: mutations.append(candidate.replace('B', '8'))
+    
+    return list(set(mutations)) # Return unique mutations only
+
+def smart_mine(text_results):
+    # 1. Join everything. The Whitelist means we have less garbage to clean.
+    full_stream = "".join(text_results)
+    
+    # 2. Extract anything that looks vaguely like a CA
+    # Since we whitelisted, almost everything remaining is a potential char
+    # We look for long blocks
+    chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', full_stream)
     
     for chunk in chunks:
-        # A. Quick cleanup (Fix common OCR typos)
-        chunk = chunk.replace('0', 'D').replace('O', 'Q').replace('l', '1').replace('I', 'j')
-        
-        # B. THE SLIDER (Brute Force Validation)
-        # We test every possible substring of length 32 to 44.
-        # This strips "NFA" from the front and "501" from the back.
+        # THE SLIDER
         chunk_len = len(chunk)
-        
-        # Optimization: Only check substrings that regex match Solana rules first
-        for length in range(32, 45): # Solana addresses are 32-44 chars
+        # Test every window of 32-44 chars
+        for length in range(32, 45):
             for start in range(0, chunk_len - length + 1):
-                candidate = chunk[start : start + length]
+                sub = chunk[start : start + length]
                 
-                # Regex Pre-check: Don't API check if it has illegal chars
-                if re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', candidate):
-                    # API Check: The final verdict
-                    pair = check_dexscreener(candidate)
-                    if pair:
-                        return candidate, pair
+                # LEVEL 1: Check raw extraction
+                pair = check_dex(sub)
+                if pair: return sub, pair
+                
+                # LEVEL 2: Check Mutations (Fixing A vs 4, etc)
+                variants = generate_mutations(sub)
+                for v in variants:
+                    if v == sub: continue
+                    pair = check_dex(v)
+                    if pair: return v, pair
 
     return None, None
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
-    status = bot.reply_to(message, "⛏️ **Mining for Alpha...**")
+    status = bot.reply_to(message, "🧠 **Constrained Neural Scan...**")
     
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
+    with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
     
-    with open("raw.jpg", 'wb') as f: f.write(downloaded_file)
-    preprocess_image("raw.jpg", "proc.jpg")
+    preprocess_image("scan.jpg", "proc.jpg")
     
     try:
-        # Scan processed AND raw (in case contrast killed the grey text)
-        results = reader.readtext("proc.jpg", detail=0) + reader.readtext("raw.jpg", detail=0)
+        # THE MAGIC LINE: allowlist=SOLANA_CHARS
+        # We force the OCR to ignore "NFA" (if we removed F/A from list, but we can't)
+        # Instead, this ensures it never reads a '?' or '@' or '0'.
+        results = reader.readtext("proc.jpg", detail=0, allowlist=SOLANA_CHARS)
     except Exception as e:
         bot.edit_message_text(f"❌ Error: {e}", message.chat.id, status.message_id)
         return
 
-    # Mine the text
-    ca, pair = mine_for_ca(results)
+    ca, pair = smart_mine(results)
     
     if ca and pair:
         msg = (
@@ -111,12 +124,12 @@ def handle_photo(message):
         
         bot.edit_message_text(msg, message.chat.id, status.message_id, parse_mode='Markdown', reply_markup=markup)
     else:
-        # Debug: Show the last 100 chars to verify we saw the text
-        debug_tail = "".join(results)[-100:]
+        # Debug
+        debug_tail = "".join(results)[-80:]
         bot.edit_message_text(
             f"❌ **Mining Failed.**\n\n"
-            f"I saw this dirt pile:\n`...{debug_tail}`\n"
-            f"I sifted through it but found no valid matches.", 
+            f"Constrained Output:\n`...{debug_tail}`\n"
+            f"Tried mutations but found no match.", 
             message.chat.id, status.message_id, parse_mode='Markdown'
         )
 
