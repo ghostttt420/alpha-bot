@@ -22,13 +22,16 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# HYBRID WHITELIST
+# HYBRID WHITELIST (Keep exactly as is)
 HYBRID_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
 
 print("🧠 Loading Neural Network...", flush=True)
 reader = easyocr.Reader(['en'], gpu=False)
 
 def process_image_at_scale(input_path, scale):
+    """
+    Generates a single image array at a specific scale.
+    """
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
@@ -99,13 +102,12 @@ def hydra_mine(text_results):
                 all_candidates.extend(mutate_dirty_string(sub))
 
     # LOGIC C: RAW SLIDER (Twitter / Messy Glue)
-    # This was missing! It catches "NFAD8FY..." by simply sliding past "NFA"
+    # Catches "NFAD8FY..." by simply sliding past "NFA"
     raw_chunks = re.findall(r'[a-zA-Z0-9]{32,}', full_stream)
     for chunk in raw_chunks:
          for length in range(32, 45):
             for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
-                # Must contain numbers and letters
                 if re.search(r'\d', sub) and re.search(r'[a-zA-Z]', sub):
                     all_candidates.append(sub)
 
@@ -118,6 +120,19 @@ def hydra_mine(text_results):
 
     return None, None
 
+def send_success_msg(message, ca, pair):
+    msg = (
+        f"✅ **Verified CA:** `{ca}`\n\n"
+        f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
+        f"💰 **Price:** `${pair['priceUsd']}`\n"
+        f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
+    )
+    markup = InlineKeyboardMarkup()
+    # Updated Referral Link as requested
+    markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://trojan.com/@ghostttt420?start={ca}"))
+    markup.add(InlineKeyboardButton("📈 Chart", url=pair['url']))
+    bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
+
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     print(f"📩 Processing photo...", flush=True)
@@ -127,8 +142,8 @@ def handle_photo(message):
         
         with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
         
-        # --- ATTEMPT 1: FAST MODE (1.5x) ---
-        # Solves Test B, C, and Twitter (via Logic C)
+        # --- PHASE 1: FAST SCAN (1.5x) ---
+        # This catches Test B, C, and Twitter instantly (~15s)
         status = bot.reply_to(message, "⚡ **Scanning (Fast Mode)...**")
         
         img_fast = process_image_at_scale("scan.jpg", 1.5)
@@ -139,8 +154,8 @@ def handle_photo(message):
             send_success_msg(message, ca, pair)
             return
 
-        # --- ATTEMPT 2: SLOW MODE (3.0x) ---
-        # Solves Test A (Tiny Text)
+        # --- PHASE 2: DEEP SCAN (3.0x) ---
+        # Only runs if Phase 1 failed. This catches Test A.
         bot.edit_message_text("🔍 **Zooming in (High-Res Mode)...**", message.chat.id, status.message_id)
         
         img_slow = process_image_at_scale("scan.jpg", 3.0)
@@ -157,17 +172,5 @@ def handle_photo(message):
         print(f"❌ Error: {e}", flush=True)
         bot.reply_to(message, "❌ System Error.")
 
-def send_success_msg(message, ca, pair):
-    msg = (
-        f"✅ **Verified CA:** `{ca}`\n\n"
-        f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
-        f"💰 **Price:** `${pair['priceUsd']}`\n"
-        f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
-    )
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
-    markup.add(InlineKeyboardButton("📈 Chart", url=pair['url']))
-    bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
-
-print("✅ Final Hydra Engine Online!", flush=True)
+print("✅ Final Optimized Bot Online!", flush=True)
 bot.infinity_polling()
