@@ -1,6 +1,6 @@
 import sys
 
-# CRASH PROOFING: Prints boot errors to logs
+# CRASH PROOFING
 print("🔄 System Booting...", flush=True)
 
 try:
@@ -23,21 +23,18 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# DIRTY WHITELIST: We INCLUDE illegal chars (0, O, I, l) to catch them, then fix them.
-SOLANA_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
+# 1. DIRTY WHITELIST (Capture Everything)
+# We capture illegal chars so we can fix them in Logic Path 2
+DIRTY_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
 
 print("🧠 Loading Neural Network...", flush=True)
-try:
-    reader = easyocr.Reader(['en'], gpu=False)
-except Exception as e:
-    print(f"❌ FATAL ERROR loading EasyOCR: {e}", flush=True)
-    sys.exit(1)
+reader = easyocr.Reader(['en'], gpu=False)
 
 def preprocess_image_to_memory(input_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
-        # 1.5x Scale: The perfect balance for CPU speed vs accuracy
+        # 1.5x Scale: Balance speed/accuracy
         new_w, new_h = int(w * 1.5), int(h * 1.5)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
@@ -51,7 +48,7 @@ def batch_check_dex(candidates):
     valid_pairs = []
     unique_candidates = list(set(candidates))
     
-    # Check 30 at a time
+    # Batch check 30 at a time
     chunk_size = 30
     for i in range(0, len(unique_candidates), chunk_size):
         batch = unique_candidates[i : i + chunk_size]
@@ -67,21 +64,20 @@ def batch_check_dex(candidates):
 
 def generate_mutations(candidate):
     """
-    EXPANDED MUTATIONS: Handles illegal chars and common shape errors.
+    LOGIC PATH 2: Fix Dirty Chars (Test B/C)
     """
     mutations = {candidate}
     
-    # Key = The mistake we see. Value = What it might actually be.
     confusions = {
         'A': ['4'], '4': ['A'],
         'B': ['8'], '8': ['B'],
         'G': ['6'], '6': ['G'],
-        'S': ['5'], '5': ['S'],  # FIXES TEST CASE C
+        'S': ['5'], '5': ['S'],  
         'Q': ['O', '0', 'D'], 
         'D': ['O', '0'],
-        '0': ['D', 'O', 'Q'],    # Illegal '0' fix
-        'O': ['D', '0', 'Q'],    # Illegal 'O' fix
-        'l': ['1', 'I'],         # Illegal 'l' fix (FIXES TEST CASE B)
+        '0': ['D', 'O', 'Q'],
+        'O': ['D', '0', 'Q'],
+        'l': ['1', 'I'],         
         'I': ['1', 'l'],         
         'Z': ['2'], '2': ['Z']
     }
@@ -97,31 +93,43 @@ def generate_mutations(candidate):
 def fast_mine(text_results):
     full_stream = "".join(text_results)
     
-    # 1. Extract blocks (Including illegal chars now so we don't break the string)
-    chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z0OIl5S]{32,}', full_stream)
-    
     all_candidates = []
+
+    # --- LOGIC PATH 1: STRICT FILTER (Solves Test A) ---
+    # We strip out the illegal chars to break apart words like "Gold" and "Dior"
+    # This isolates the CA if it was sandwiched.
+    strict_stream = re.sub(r'[0OIl5S]', '', full_stream)
+    strict_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', strict_stream)
     
-    for chunk in chunks:
+    for chunk in strict_chunks:
         chunk_len = len(chunk)
-        # Check lengths 32-45 (Covering standard 43/44)
+        for length in range(32, 45):
+            for start in range(0, chunk_len - length + 1):
+                sub = chunk[start : start + length]
+                if len(set(sub)) < 20: continue
+                all_candidates.append(sub) # Raw addition
+
+    # --- LOGIC PATH 2: DIRTY REPAIR (Solves Test B/C) ---
+    # We use the full dirty stream and apply mutations
+    dirty_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z0OIl5S]{32,}', full_stream)
+    
+    for chunk in dirty_chunks:
+        chunk_len = len(chunk)
         for length in range(32, 45): 
             for start in range(0, chunk_len - length + 1):
                 sub = chunk[start : start + length]
-                
-                # Entropy Filter: <15 unique chars = probably noise
                 if len(set(sub)) < 15: continue
-
-                # Generate fixes for "Dirty" chars
+                
+                # Apply mutations (S->5, 0->D)
                 variants = generate_mutations(sub)
                 all_candidates.extend(variants)
 
     if not all_candidates: return None, None
     
+    # Check EVERYTHING
     valid_pairs = batch_check_dex(all_candidates)
     
     if valid_pairs:
-        # Return most liquid pair
         best_pair = max(valid_pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0)))
         return best_pair['baseToken']['address'], best_pair
 
@@ -137,9 +145,11 @@ def handle_photo(message):
         with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
         
         img_array = preprocess_image_to_memory("scan.jpg")
-        # Read using the DIRTY whitelist
-        results = reader.readtext(img_array, detail=0, allowlist=SOLANA_CHARS)
         
+        # SINGLE OCR PASS (Fast)
+        results = reader.readtext(img_array, detail=0, allowlist=DIRTY_CHARS)
+        
+        # DUAL LOGIC PROCESSING (Smart)
         ca, pair = fast_mine(results)
         
         if ca and pair:
@@ -150,13 +160,11 @@ def handle_photo(message):
                 f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
             )
             markup = InlineKeyboardMarkup()
-            # Deep link to Trojan Bot with your ref
             markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
             markup.add(InlineKeyboardButton("📈 Chart", url=pair['url']))
             
             bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
         else:
-            # Debug helper
             debug_tail = "".join(results)[-50:]
             bot.reply_to(message, f"❌ No Valid Token Found.\nDebug: `...{debug_tail}`", parse_mode='Markdown')
             
