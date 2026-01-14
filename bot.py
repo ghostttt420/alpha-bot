@@ -23,8 +23,8 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# HYBRID WHITELIST: Capture everything that MIGHT be a char.
-# We include 0, O, I, l (Illegal) and S, 5 (Common Typos) to process them later.
+# WHITELIST: We capture standard chars + illegal ones + common typos
+# We capture EVERYTHING here. Filtering happens later in the "Engines".
 HYBRID_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
 
 print("🧠 Loading Neural Network...", flush=True)
@@ -34,7 +34,6 @@ def preprocess_image_to_memory(input_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
-        # 1.5x Scale: Validated as the best speed/accuracy balance
         new_w, new_h = int(w * 1.5), int(h * 1.5)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
@@ -47,7 +46,6 @@ def batch_check_dex(candidates):
     valid_pairs = []
     unique_candidates = list(set(candidates))
     
-    # Check 30 at a time
     chunk_size = 30
     for i in range(0, len(unique_candidates), chunk_size):
         batch = unique_candidates[i : i + chunk_size]
@@ -62,7 +60,7 @@ def batch_check_dex(candidates):
 
 def mutate_dirty_string(candidate):
     """
-    Used by Engine 2: Swaps typos for valid chars.
+    LOGIC B & C: Swaps typos for valid chars.
     """
     mutations = {candidate}
     confusions = {
@@ -70,7 +68,7 @@ def mutate_dirty_string(candidate):
         'l': ['1', 'I'], 'I': ['1', 'l'],
         'A': ['4'], '4': ['A'],
         'B': ['8'], '8': ['B'],
-        'S': ['5'], '5': ['S'], # Crucial for Test C
+        'S': ['5'], '5': ['S'], # Fixes Test C
         'G': ['6'], '6': ['G']
     }
     
@@ -85,13 +83,12 @@ def hydra_mine(text_results):
     full_stream = "".join(text_results)
     all_candidates = []
 
-    # --- ENGINE 1: THE PURIST (Solves Test A) ---
-    # BUG FIX: Only remove TRULY illegal chars (0, O, I, l). 
-    # Do NOT remove '5' or 'S' (they are valid!). 
-    # This was deleting the 'S' in your Test A address.
+    # === LOGIC A: THE STRICT FILTER (Restores Test A) ===
+    # Strategy: Delete ONLY truly illegal chars (0, O, I, l).
+    # CRITICAL FIX: We do NOT delete 'S' or '5' here. They are valid!
+    # This ensures "Gold" (contains l) breaks apart, but "JGSm" (contains S) stays intact.
     strict_stream = re.sub(r'[0OIl]', '', full_stream) 
     
-    # Look for clean Base58 blocks (Standard Regex)
     clean_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', strict_stream)
     for chunk in clean_chunks:
         for length in range(32, 45):
@@ -99,26 +96,25 @@ def hydra_mine(text_results):
                 sub = chunk[start : start + length]
                 if len(set(sub)) > 15: all_candidates.append(sub)
 
-    # --- ENGINE 2: THE MUTANT (Solves Test B & C) ---
-    # Strategy: Capture "Dirty" blocks (with 0, l, S, 5) and mutate them.
-    # This fixes Test C (S -> 5) and Test B (Wrapped lines with 0/l).
+    # === LOGIC B & C: THE DIRTY FILTER (Maintains Test B & C) ===
+    # Strategy: Keep everything. Mutate S->5, 0->D.
+    # This catches typos and wrapped lines.
     dirty_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z0OIl5S]{32,}', full_stream)
     for chunk in dirty_chunks:
         for length in range(32, 45):
             for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
                 if len(set(sub)) < 15: continue
-                # Apply mutations (S->5, 0->D, etc)
+                # Apply mutations 
                 all_candidates.extend(mutate_dirty_string(sub))
 
-    # --- ENGINE 3: THE RAW SLIDER (Solves Twitter/Messy) ---
-    # Strategy: Trust the OCR. Sometimes the regex is too smart for its own good.
+    # === LOGIC D: RAW SLIDER (Twitter/Messy Backup) ===
+    # Just in case our regexes are too smart, scan raw alphanumeric blocks.
     raw_chunks = re.findall(r'[a-zA-Z0-9]{32,}', full_stream)
     for chunk in raw_chunks:
          for length in range(32, 45):
             for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
-                # Must contain at least 1 number and 1 letter to be a CA
                 if re.search(r'\d', sub) and re.search(r'[a-zA-Z]', sub):
                     all_candidates.append(sub)
 
@@ -144,10 +140,10 @@ def handle_photo(message):
         
         img_array = preprocess_image_to_memory("scan.jpg")
         
-        # Single OCR Pass
+        # Single OCR Pass (Captures Good + Bad chars)
         results = reader.readtext(img_array, detail=0, allowlist=HYBRID_CHARS)
         
-        # Hydra Logic
+        # Logic Processing
         ca, pair = hydra_mine(results)
         
         if ca and pair:
@@ -170,5 +166,5 @@ def handle_photo(message):
         print(f"❌ Error: {e}", flush=True)
         bot.reply_to(message, "❌ System Error.")
 
-print("✅ Hydra Engine (Optimized) Online!", flush=True)
+print("✅ Logic Corrected. Bot Online!", flush=True)
 bot.infinity_polling()
