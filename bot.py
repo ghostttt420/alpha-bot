@@ -1,6 +1,5 @@
 import sys
 
-# CRASH PROOFING
 print("🔄 System Booting...", flush=True)
 
 try:
@@ -23,9 +22,9 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# 1. DIRTY WHITELIST (Capture Everything)
-# We capture illegal chars so we can fix them in Logic Path 2
-DIRTY_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
+# HYBRID WHITELIST: Capture standard chars + illegal ones (0,O,I,l) + common typos (5, S)
+# We need to capture these so Engine 2 can fix them.
+HYBRID_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
 
 print("🧠 Loading Neural Network...", flush=True)
 reader = easyocr.Reader(['en'], gpu=False)
@@ -34,21 +33,19 @@ def preprocess_image_to_memory(input_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
-        # 1.5x Scale: Balance speed/accuracy
         new_w, new_h = int(w * 1.5), int(h * 1.5)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
         img = ImageOps.grayscale(img)
         img = ImageEnhance.Contrast(img).enhance(2.0)
         img = ImageEnhance.Sharpness(img).enhance(1.5)
-        
         return np.array(img)
 
 def batch_check_dex(candidates):
     valid_pairs = []
     unique_candidates = list(set(candidates))
     
-    # Batch check 30 at a time
+    # Check 30 at a time
     chunk_size = 30
     for i in range(0, len(unique_candidates), chunk_size):
         batch = unique_candidates[i : i + chunk_size]
@@ -59,27 +56,20 @@ def batch_check_dex(candidates):
             if res.get('pairs'):
                 valid_pairs.extend(res['pairs'])
         except: pass
-            
     return valid_pairs
 
-def generate_mutations(candidate):
+def mutate_dirty_string(candidate):
     """
-    LOGIC PATH 2: Fix Dirty Chars (Test B/C)
+    Used by Engine 2: Swaps illegal chars for valid ones.
     """
     mutations = {candidate}
-    
     confusions = {
+        '0': ['D', 'O', 'Q'], 'O': ['D', '0', 'Q'],
+        'l': ['1', 'I'], 'I': ['1', 'l'],
         'A': ['4'], '4': ['A'],
         'B': ['8'], '8': ['B'],
-        'G': ['6'], '6': ['G'],
-        'S': ['5'], '5': ['S'],  
-        'Q': ['O', '0', 'D'], 
-        'D': ['O', '0'],
-        '0': ['D', 'O', 'Q'],
-        'O': ['D', '0', 'Q'],
-        'l': ['1', 'I'],         
-        'I': ['1', 'l'],         
-        'Z': ['2'], '2': ['Z']
+        'S': ['5'], '5': ['S'],
+        'G': ['6'], '6': ['G']
     }
     
     for i, char in enumerate(candidate):
@@ -87,46 +77,52 @@ def generate_mutations(candidate):
             for replacement in confusions[char]:
                 new_variant = candidate[:i] + replacement + candidate[i+1:]
                 mutations.add(new_variant)
-                
     return list(mutations)
 
-def fast_mine(text_results):
+def hydra_mine(text_results):
     full_stream = "".join(text_results)
-    
     all_candidates = []
 
-    # --- LOGIC PATH 1: STRICT FILTER (Solves Test A) ---
-    # We strip out the illegal chars to break apart words like "Gold" and "Dior"
-    # This isolates the CA if it was sandwiched.
-    strict_stream = re.sub(r'[0OIl5S]', '', full_stream)
-    strict_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', strict_stream)
-    
-    for chunk in strict_chunks:
-        chunk_len = len(chunk)
+    # --- ENGINE 1: THE PURIST (Solves Test A) ---
+    # Strategy: Aggressively delete all illegal chars (0, O, I, l).
+    # This effectively "unglues" words like "Gold" or "Dior" from the CA.
+    clean_stream = re.sub(r'[0OIl5S]', '', full_stream) 
+    # Look for clean Base58 blocks
+    clean_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', clean_stream)
+    for chunk in clean_chunks:
+        # Standard sliding window
         for length in range(32, 45):
-            for start in range(0, chunk_len - length + 1):
+            for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
-                if len(set(sub)) < 20: continue
-                all_candidates.append(sub) # Raw addition
+                if len(set(sub)) > 15: all_candidates.append(sub)
 
-    # --- LOGIC PATH 2: DIRTY REPAIR (Solves Test B/C) ---
-    # We use the full dirty stream and apply mutations
+    # --- ENGINE 2: THE MUTANT (Solves Test B & C) ---
+    # Strategy: Keep illegal chars and mutate them.
+    # Essential for when the address itself has a typo (Test C) or wrapped with '0' (Test B).
     dirty_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z0OIl5S]{32,}', full_stream)
-    
     for chunk in dirty_chunks:
-        chunk_len = len(chunk)
-        for length in range(32, 45): 
-            for start in range(0, chunk_len - length + 1):
+        for length in range(32, 45):
+            for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
                 if len(set(sub)) < 15: continue
-                
-                # Apply mutations (S->5, 0->D)
-                variants = generate_mutations(sub)
-                all_candidates.extend(variants)
+                # Apply mutations
+                all_candidates.extend(mutate_dirty_string(sub))
+
+    # --- ENGINE 3: THE RAW SLIDER (Solves Twitter/Messy) ---
+    # Strategy: Trust the OCR. Sometimes the text is perfect but our regex filters ruin it.
+    # We grab ANY long alphanumeric string and check it raw.
+    raw_chunks = re.findall(r'[a-zA-Z0-9]{32,}', full_stream)
+    for chunk in raw_chunks:
+         for length in range(32, 45):
+            for start in range(0, len(chunk) - length + 1):
+                sub = chunk[start : start + length]
+                # Light filter only (must have some numbers and letters)
+                if re.search(r'\d', sub) and re.search(r'[a-zA-Z]', sub):
+                    all_candidates.append(sub)
 
     if not all_candidates: return None, None
     
-    # Check EVERYTHING
+    # Batch Check All Candidates
     valid_pairs = batch_check_dex(all_candidates)
     
     if valid_pairs:
@@ -137,7 +133,7 @@ def fast_mine(text_results):
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
-    print(f"📩 Photo received...", flush=True)
+    print(f"📩 Processing photo...", flush=True)
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
@@ -146,11 +142,10 @@ def handle_photo(message):
         
         img_array = preprocess_image_to_memory("scan.jpg")
         
-        # SINGLE OCR PASS (Fast)
-        results = reader.readtext(img_array, detail=0, allowlist=DIRTY_CHARS)
+        # Read with HYBRID whitelist (Captures good and bad chars)
+        results = reader.readtext(img_array, detail=0, allowlist=HYBRID_CHARS)
         
-        # DUAL LOGIC PROCESSING (Smart)
-        ca, pair = fast_mine(results)
+        ca, pair = hydra_mine(results)
         
         if ca and pair:
             msg = (
@@ -165,12 +160,12 @@ def handle_photo(message):
             
             bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
         else:
-            debug_tail = "".join(results)[-50:]
+            debug_tail = "".join(results)[-60:]
             bot.reply_to(message, f"❌ No Valid Token Found.\nDebug: `...{debug_tail}`", parse_mode='Markdown')
             
     except Exception as e:
         print(f"❌ Error: {e}", flush=True)
         bot.reply_to(message, "❌ System Error.")
 
-print("✅ Bot is Online!", flush=True)
+print("✅ Hydra Engine Online!", flush=True)
 bot.infinity_polling()
