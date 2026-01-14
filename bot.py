@@ -28,33 +28,20 @@ HYBRID_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S
 print("🧠 Loading Neural Network...", flush=True)
 reader = easyocr.Reader(['en'], gpu=False)
 
-def get_multi_scale_images(input_path):
+def process_image_at_scale(input_path, scale):
     """
-    YOUR THEORY APPLIED:
-    Returns TWO versions of the image.
-    1. Small Scale (1.5x) -> For zoomed-in screenshots (Test B/C)
-    2. Large Scale (3.0x) -> For full-screen screenshots (Test A)
+    Generates a single image array at a specific scale.
     """
-    images = []
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
-        # Define the two scales we need
-        scales = [1.5, 3.0]
-        
-        for scale in scales:
-            new_w, new_h = int(w * scale), int(h * scale)
-            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            
-            # Apply Contrast/Sharpness
-            gray = ImageOps.grayscale(resized)
-            gray = ImageEnhance.Contrast(gray).enhance(2.0)
-            gray = ImageEnhance.Sharpness(gray).enhance(1.5)
-            
-            images.append(np.array(gray))
-            
-    return images
+        img = ImageOps.grayscale(img)
+        img = ImageEnhance.Contrast(img).enhance(2.0)
+        img = ImageEnhance.Sharpness(img).enhance(1.5)
+        return np.array(img)
 
 def batch_check_dex(candidates):
     valid_pairs = []
@@ -94,8 +81,7 @@ def hydra_mine(text_results):
     full_stream = "".join(text_results)
     all_candidates = []
 
-    # === LOGIC A: STRICT FILTER (For Test A / Clean Text) ===
-    # Only remove illegal chars (0,O,I,l). Keep 'S' and '5'.
+    # LOGIC A: STRICT FILTER (Test A / Clean)
     strict_stream = re.sub(r'[0OIl]', '', full_stream) 
     clean_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', strict_stream)
     for chunk in clean_chunks:
@@ -104,8 +90,7 @@ def hydra_mine(text_results):
                 sub = chunk[start : start + length]
                 if len(set(sub)) > 15: all_candidates.append(sub)
 
-    # === LOGIC B: DIRTY FILTER (For Test B & C / Typos) ===
-    # Keep everything and mutate.
+    # LOGIC B: DIRTY FILTER (Test B & C / Typos)
     dirty_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z0OIl5S]{32,}', full_stream)
     for chunk in dirty_chunks:
         for length in range(32, 45):
@@ -132,38 +117,51 @@ def handle_photo(message):
         
         with open("scan.jpg", 'wb') as f: f.write(downloaded_file)
         
-        # 1. Get BOTH scales (1.5x and 3.0x)
-        img_arrays = get_multi_scale_images("scan.jpg")
+        # --- ATTEMPT 1: FAST MODE (1.5x) ---
+        # This solves Test B, C, and Twitter Screenshots in ~30s
+        status = bot.reply_to(message, "⚡ **Scanning (Fast Mode)...**")
         
-        all_results = []
-        
-        # 2. Run OCR on BOTH images
-        for i, img_array in enumerate(img_arrays):
-            # We combine the text from both passes into one big list
-            all_results += reader.readtext(img_array, detail=0, allowlist=HYBRID_CHARS)
-        
-        # 3. Process the combined data
-        ca, pair = hydra_mine(all_results)
+        img_fast = process_image_at_scale("scan.jpg", 1.5)
+        results_fast = reader.readtext(img_fast, detail=0, allowlist=HYBRID_CHARS)
+        ca, pair = hydra_mine(results_fast)
         
         if ca and pair:
-            msg = (
-                f"✅ **Verified CA:** `{ca}`\n\n"
-                f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
-                f"💰 **Price:** `${pair['priceUsd']}`\n"
-                f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
-            )
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
-            markup.add(InlineKeyboardButton("📈 Chart", url=pair['url']))
-            
-            bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
+            # SUCCESS ON FAST PASS
+            send_success_msg(message, ca, pair)
+            return
+
+        # --- ATTEMPT 2: SLOW MODE (3.0x) ---
+        # Only runs if Fast Mode fails. This solves Test A (Tiny Text).
+        bot.edit_message_text("🔍 **Zooming in (High-Res Mode)...**", message.chat.id, status.message_id)
+        
+        img_slow = process_image_at_scale("scan.jpg", 3.0)
+        results_slow = reader.readtext(img_slow, detail=0, allowlist=HYBRID_CHARS)
+        
+        # Merge results? No, usually separate runs are safer to avoid noise.
+        # Just check the slow results.
+        ca, pair = hydra_mine(results_slow)
+        
+        if ca and pair:
+            send_success_msg(message, ca, pair)
         else:
-            debug_tail = "".join(all_results)[-60:]
-            bot.reply_to(message, f"❌ No Valid Token Found.\nDebug: `...{debug_tail}`", parse_mode='Markdown')
+            debug_tail = "".join(results_fast + results_slow)[-60:]
+            bot.reply_to(message, f"❌ No Valid Token Found.\nDebug: `...{debug_tail}`")
             
     except Exception as e:
         print(f"❌ Error: {e}", flush=True)
         bot.reply_to(message, "❌ System Error.")
 
-print("✅ Multi-Scale Engine Online!", flush=True)
+def send_success_msg(message, ca, pair):
+    msg = (
+        f"✅ **Verified CA:** `{ca}`\n\n"
+        f"💎 **{pair['baseToken']['name']}** (${pair['baseToken']['symbol']})\n"
+        f"💰 **Price:** `${pair['priceUsd']}`\n"
+        f"📊 **Liq:** `${pair['liquidity']['usd']:,}`\n"
+    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚀 Trade (Trojan)", url=f"https://t.me/solana_trojanbot?start=r-ghostt-{ca}"))
+    markup.add(InlineKeyboardButton("📈 Chart", url=pair['url']))
+    bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
+
+print("✅ Smart-Scale Engine Online!", flush=True)
 bot.infinity_polling()
