@@ -1,5 +1,6 @@
 import sys
 
+# CRASH PROOFING
 print("🔄 System Booting...", flush=True)
 
 try:
@@ -23,16 +24,18 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 # HYBRID WHITELIST: Capture standard chars + illegal ones (0,O,I,l) + common typos (5, S)
-# We need to capture these so Engine 2 can fix them.
+# We capture everything here so the 3 Engines can filter it differently later.
 HYBRID_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0OIl5S"
 
 print("🧠 Loading Neural Network...", flush=True)
+# gpu=False is CRITICAL for GitHub Actions stability
 reader = easyocr.Reader(['en'], gpu=False)
 
 def preprocess_image_to_memory(input_path):
     with Image.open(input_path) as img:
         img = img.convert('RGB')
         w, h = img.size
+        # 1.5x Scale: Validated as the best speed/accuracy balance
         new_w, new_h = int(w * 1.5), int(h * 1.5)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
@@ -43,9 +46,10 @@ def preprocess_image_to_memory(input_path):
 
 def batch_check_dex(candidates):
     valid_pairs = []
+    # DEDUPLICATION IS CRITICAL HERE FOR SPEED
     unique_candidates = list(set(candidates))
     
-    # Check 30 at a time
+    # Check 30 at a time (DexScreener API Limit)
     chunk_size = 30
     for i in range(0, len(unique_candidates), chunk_size):
         batch = unique_candidates[i : i + chunk_size]
@@ -85,10 +89,10 @@ def hydra_mine(text_results):
 
     # --- ENGINE 1: THE PURIST (Solves Test A) ---
     # Strategy: Aggressively delete all illegal chars (0, O, I, l).
-    # This effectively "unglues" words like "Gold" or "Dior" from the CA.
-    clean_stream = re.sub(r'[0OIl5S]', '', full_stream) 
+    # This effectively "unglues" words like "Gold" (l,o) or "Dior" (o) from the CA.
+    strict_stream = re.sub(r'[0OIl5S]', '', full_stream) 
     # Look for clean Base58 blocks
-    clean_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', clean_stream)
+    clean_chunks = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,}', strict_stream)
     for chunk in clean_chunks:
         # Standard sliding window
         for length in range(32, 45):
@@ -116,13 +120,12 @@ def hydra_mine(text_results):
          for length in range(32, 45):
             for start in range(0, len(chunk) - length + 1):
                 sub = chunk[start : start + length]
-                # Light filter only (must have some numbers and letters)
                 if re.search(r'\d', sub) and re.search(r'[a-zA-Z]', sub):
                     all_candidates.append(sub)
 
     if not all_candidates: return None, None
     
-    # Batch Check All Candidates
+    # CONSOLIDATION: Batch Check All Candidates
     valid_pairs = batch_check_dex(all_candidates)
     
     if valid_pairs:
@@ -142,9 +145,10 @@ def handle_photo(message):
         
         img_array = preprocess_image_to_memory("scan.jpg")
         
-        # Read with HYBRID whitelist (Captures good and bad chars)
+        # SINGLE OCR PASS (Fast)
         results = reader.readtext(img_array, detail=0, allowlist=HYBRID_CHARS)
         
+        # HYBRID LOGIC PROCESSING
         ca, pair = hydra_mine(results)
         
         if ca and pair:
