@@ -1,7 +1,7 @@
 # ==========================================
 # 🤖 STEP 4: THE BOT ENGINE (OPTIMIZED HYBRID MODE)
 # ==========================================
-import userdata
+import sys
 import re
 import requests
 import telebot
