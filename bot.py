@@ -1,7 +1,7 @@
 # ==========================================
 # 🤖 STEP 4: THE BOT ENGINE (OPTIMIZED HYBRID MODE)
 # ==========================================
-from google.colab import userdata
+import userdata
 import re
 import requests
 import telebot
